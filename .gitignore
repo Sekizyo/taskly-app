@@ -12,3 +12,6 @@ htmlcov/
 *.db-wal
 .env
 .DS_Store
+
+# Test agent scratch output
+.test-agent/

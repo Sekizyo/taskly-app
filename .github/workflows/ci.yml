@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python -m pip install --quiet -r backend/requirements.txt
+      - name: pytest with coverage
+        run: scripts/agent/run_tests.sh backend "$RUNNER_TEMP/results"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: backend-results
+          path: ${{ runner.temp }}/results
+          retention-days: 7
+
+  frontend:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --prefix frontend --ignore-scripts --no-audit --no-fund
+      - name: Vitest with coverage
+        run: scripts/agent/run_tests.sh frontend "$RUNNER_TEMP/results"
+      - name: Typecheck
+        run: npm run --prefix frontend typecheck
+      - name: Formatting
+        run: npm run --prefix frontend format:check
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: frontend-results
+          path: ${{ runner.temp }}/results
+          retention-days: 7
+
+  agent-tooling:
+    name: Agent tooling tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --quiet pytest==9.1.1
+      - name: Guard, scoping and report tests
+        run: python -m pytest -q -p no:cacheprovider scripts/agent/tests
+      - name: Agent definitions are well-formed
+        run: |
+          python - <<'EOF'
+          import json, pathlib, re, sys
+          ok = True
+          for path in [pathlib.Path(".claude/agents/test-engineer.md"), *pathlib.Path(".claude/skills").glob("*/SKILL.md")]:
+              front = re.match(r"^---\n(.*?)\n---\n", path.read_text(), re.S)
+              fields = dict(line.split(":", 1) for line in front.group(1).splitlines() if ":" in line and not line.startswith(" ")) if front else {}
+              if not fields.get("name", "").strip() or not fields.get("description", "").strip():
+                  print(f"::error file={path}::missing name/description frontmatter"); ok = False
+              if path.name == "SKILL.md" and fields.get("name", "").strip() != path.parent.name:
+                  print(f"::error file={path}::skill name must match its directory"); ok = False
+          for path in [".claude/settings.json", ".github/test-agent/settings.json"]:
+              json.loads(pathlib.Path(path).read_text())
+          sys.exit(0 if ok else 1)
+          EOF

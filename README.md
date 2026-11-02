@@ -1,5 +1,7 @@
 # Taskly App
 
+> Unit-test agent and agentic PR workflow: see [SOLUTION.md](SOLUTION.md).
+
 ## Setup
 
 ```sh

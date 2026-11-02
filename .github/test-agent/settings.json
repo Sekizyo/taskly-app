@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Skill",
+      "Bash(scripts/agent/run_tests.sh:*)",
+      "Bash(python3 scripts/agent/changed_files.py:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git status:*)",
+      "Edit(backend/tests/**)",
+      "Edit(frontend/src/**/*.test.ts)",
+      "Edit(frontend/src/**/*.test.tsx)",
+      "Edit(.test-agent/**)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(**/.env)",
+      "Read(.git/**)",
+      "WebFetch",
+      "WebSearch",
+      "Edit(.claude/**)",
+      "Edit(.github/**)",
+      "Edit(scripts/**)",
+      "Edit(backend/app/**)",
+      "Edit(**/package.json)",
+      "Edit(**/package-lock.json)",
+      "Edit(**/requirements*.txt)",
+      "Edit(**/pyproject.toml)",
+      "Edit(**/vite.config.ts)",
+      "Edit(**/conftest.py)"
+    ]
+  }
+}

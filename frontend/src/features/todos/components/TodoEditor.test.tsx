@@ -46,3 +46,68 @@ it('creates a new task and reports a successful save', async () => {
   expect(create).toHaveBeenCalledWith(todoFixture)
   expect(update).not.toHaveBeenCalled()
 })
+
+function mockMutations(update: Record<string, unknown>) {
+  vi.mocked(useCreateTodoMutation).mockReturnValue({
+    isPending: false,
+    error: null,
+    mutateAsync: vi.fn(),
+  } as unknown as ReturnType<typeof useCreateTodoMutation>)
+  vi.mocked(useUpdateTodoMutation).mockReturnValue({
+    isPending: false,
+    error: null,
+    mutateAsync: vi.fn(),
+    ...update,
+  } as unknown as ReturnType<typeof useUpdateTodoMutation>)
+}
+
+it('updates an existing task and reports saved changes', async () => {
+  const user = userEvent.setup()
+  const update = vi.fn().mockResolvedValue(todoFixture)
+  mockMutations({ mutateAsync: update })
+  const onSaved = vi.fn()
+  render(
+    <TodoEditor
+      todo={todoFixture}
+      busy={false}
+      onClose={vi.fn()}
+      onSaved={onSaved}
+    />,
+  )
+  expect(screen.getByRole('dialog', { name: 'Edit task' })).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Submit form' }))
+  await waitFor(() => expect(onSaved).toHaveBeenCalledWith('Changes saved.'))
+  expect(update).toHaveBeenCalledWith({
+    id: todoFixture.id,
+    input: todoFixture,
+  })
+})
+
+it('keeps the editor open when saving fails', async () => {
+  const user = userEvent.setup()
+  const update = vi.fn().mockRejectedValue(new Error('Server error'))
+  mockMutations({ mutateAsync: update })
+  const onSaved = vi.fn()
+  render(
+    <TodoEditor
+      todo={todoFixture}
+      busy={false}
+      onClose={vi.fn()}
+      onSaved={onSaved}
+    />,
+  )
+  await user.click(screen.getByRole('button', { name: 'Submit form' }))
+  await waitFor(() => expect(update).toHaveBeenCalledTimes(1))
+  expect(onSaved).not.toHaveBeenCalled()
+})
+
+it('ignores submissions while another operation is running', async () => {
+  const user = userEvent.setup()
+  const update = vi.fn()
+  mockMutations({ mutateAsync: update })
+  render(
+    <TodoEditor todo={todoFixture} busy onClose={vi.fn()} onSaved={vi.fn()} />,
+  )
+  await user.click(screen.getByRole('button', { name: 'Submit form' }))
+  expect(update).not.toHaveBeenCalled()
+})

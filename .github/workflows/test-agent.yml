@@ -1,0 +1,476 @@
+# Agentic unit-test workflow for pull requests.
+#
+#   scope ──► generate ──► verify ──► publish
+#   (read)    (read +      (read,     (write: commit + PR comment;
+#              API key)     no         never executes PR code)
+#                           secrets)
+#
+# * scope    – deterministic: which changed files are testable? Skips the agent otherwise.
+# * generate – runs the `test-engineer` Claude Code agent with a locked-down tool policy.
+#              Only job that holds ANTHROPIC_API_KEY; produces a patch + report artifact.
+# * verify   – path-guards the patch, applies it and independently re-runs the suites,
+#              repeats new tests (flakiness), typechecks and format-checks.
+# * publish  – commits the verified patch to the PR branch and upserts one sticky PR comment.
+name: Test agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+permissions: {}
+
+concurrency:
+  group: test-agent-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CLAUDE_CODE_VERSION: "2.1.316"
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.13"
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  scope:
+    name: Scope changes
+    # Fork PRs never receive secrets and must not get a write token: skip them entirely.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-test-agent') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'run-test-agent')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      needs_agent: ${{ steps.scope.outputs.needs_agent }}
+      stacks: ${{ steps.scope.outputs.stacks }}
+      self_commit: ${{ steps.scope.outputs.self_commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Use agent tooling from the base branch
+        run: &trusted |
+          # The PR under test must not be able to change the rules it is evaluated by.
+          for path in .claude scripts/agent .github/test-agent; do
+            if git cat-file -e "$BASE_SHA:$path" 2>/dev/null; then
+              rm -rf "$path"
+              git restore --source="$BASE_SHA" --worktree -- "$path"
+            fi
+          done
+
+      - name: Classify changed files
+        id: scope
+        run: |
+          mkdir -p "$RUNNER_TEMP/scope"
+          python3 scripts/agent/changed_files.py --base "$BASE_SHA" --head "$HEAD_SHA" \
+            > "$RUNNER_TEMP/scope/changes.json"
+          cat "$RUNNER_TEMP/scope/changes.json"
+          if git log -1 --format=%B "$HEAD_SHA" | grep -qx 'Test-Agent: true'; then
+            # Head is the agent's own commit (e.g. re-labelled): nothing new to analyse.
+            echo "self_commit=true" >> "$GITHUB_OUTPUT"
+            echo "needs_agent=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "self_commit=false" >> "$GITHUB_OUTPUT"
+            python3 - "$RUNNER_TEMP/scope/changes.json" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          print(f"needs_agent={str(data['needs_agent']).lower()}")
+          print(f"stacks={' '.join(data['stacks'])}")
+          EOF
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scope
+          path: ${{ runner.temp }}/scope
+          retention-days: 7
+
+  generate:
+    name: Generate tests (agent)
+    needs: scope
+    if: needs.scope.outputs.needs_agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      STACKS: ${{ needs.scope.outputs.stacks }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Use agent tooling from the base branch
+        run: *trusted
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: contains(needs.scope.outputs.stacks, 'backend')
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install project dependencies
+        run: &install |
+          if [[ " $STACKS " == *" backend "* ]]; then
+            python -m venv backend/.venv
+            backend/.venv/bin/python -m pip install --quiet -r backend/requirements.txt
+          fi
+          if [[ " $STACKS " == *" frontend "* ]]; then
+            # --ignore-scripts: dependency lifecycle scripts never run in agent jobs.
+            npm ci --prefix frontend --ignore-scripts --no-audit --no-fund
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: scope
+          path: .test-agent
+
+      - name: Baseline test run (before the agent)
+        run: |
+          mkdir -p .test-agent/baseline
+          for stack in $STACKS; do
+            set +e
+            scripts/agent/run_tests.sh "$stack" .test-agent/baseline > ".test-agent/baseline/$stack.log" 2>&1
+            echo "$stack=$?" >> .test-agent/baseline/codes
+            set -e
+            tail -n 5 ".test-agent/baseline/$stack.log"
+          done
+          python3 - <<'EOF'
+          import json
+          codes = dict(line.strip().split("=") for line in open(".test-agent/baseline/codes"))
+          json.dump({k: int(v) for k, v in codes.items()}, open(".test-agent/baseline-status.json", "w"))
+          EOF
+
+      - name: Install Claude Code
+        run: |
+          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          claude --version
+
+      - name: Run test-engineer agent
+        id: agent
+        timeout-minutes: 25
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Strip credentials from every subprocess the agent starts (pytest, vitest, ...).
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          DISABLE_AUTOUPDATER: "1"
+          MODEL: ${{ vars.TEST_AGENT_MODEL || 'claude-sonnet-5-5' }}
+          MAX_BUDGET_USD: ${{ vars.TEST_AGENT_MAX_BUDGET_USD || '5' }}
+        run: |
+          if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not configured"
+            echo "exit_code=78" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # shellcheck disable=SC2016 # literal variable names: envsubst substitutes only these
+          envsubst '${BASE_SHA} ${HEAD_SHA}' < .github/test-agent/prompt.md > "$RUNNER_TEMP/prompt.md"
+          set +e
+          claude -p "$(cat "$RUNNER_TEMP/prompt.md")" \
+            --agent test-engineer \
+            --model "$MODEL" \
+            --settings .github/test-agent/settings.json \
+            --permission-mode dontAsk \
+            --tools "Read,Grep,Glob,Edit,Write,Bash,Skill" \
+            --max-budget-usd "$MAX_BUDGET_USD" \
+            --output-format json \
+            --no-session-persistence \
+            > .test-agent/claude-result.json
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print({k: d.get(k) for k in ("subtype","is_error","num_turns","total_cost_usd","duration_ms")})' \
+            .test-agent/claude-result.json || true
+
+      - name: Collect agent output
+        if: always()
+        env:
+          AGENT_EXIT: ${{ steps.agent.outputs.exit_code }}
+        run: |
+          out="$RUNNER_TEMP/agent-output"
+          mkdir -p "$out/agent"
+          # Patch = everything the agent changed. Tooling paths are excluded because they
+          # were replaced by the base-branch version above; any agent edit there is discarded.
+          git ls-files --others --exclude-standard -z | xargs -0 -r git add --intent-to-add --
+          git diff --binary HEAD -- . ':(exclude).claude' ':(exclude).github' ':(exclude)scripts/agent' \
+            > "$out/agent/agent.patch"
+          git diff --stat HEAD -- . ':(exclude).claude' ':(exclude).github' ':(exclude)scripts/agent'
+          cp .test-agent/changes.json "$out/"
+          cp -r .test-agent/baseline "$out/baseline" 2>/dev/null || true
+          cp .test-agent/report.json .test-agent/claude-result.json "$out/agent/" 2>/dev/null || true
+          echo "${AGENT_EXIT:-1}" > "$out/agent/exit_code"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: agent-output
+          path: ${{ runner.temp }}/agent-output
+          retention-days: 14
+
+  verify:
+    name: Verify generated tests
+    needs: [scope, generate]
+    if: needs.generate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      STACKS: ${{ needs.scope.outputs.stacks }}
+    outputs:
+      outcome: ${{ steps.result.outputs.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Use agent tooling from the base branch
+        run: *trusted
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-output
+          path: ${{ runner.temp }}/results
+
+      - name: Guard patch paths
+        id: guard
+        run: |
+          R="$RUNNER_TEMP/results"
+          set +e
+          python3 scripts/agent/guard_paths.py "$R/agent/agent.patch" > "$R/guard.json"
+          code=$?
+          set -e
+          cat "$R/guard.json"
+          empty=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["empty"]).lower())' "$R/guard.json")
+          agent_exit=$(cat "$R/agent/exit_code")
+          if [[ $code -ne 0 ]]; then state=rejected
+          elif [[ $empty == true && $agent_exit == 0 ]]; then state=no-changes
+          elif [[ $empty == true ]]; then state=agent-failed
+          else state=apply
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Apply patch
+        if: steps.guard.outputs.state == 'apply'
+        run: |
+          git apply --check "$RUNNER_TEMP/results/agent/agent.patch"
+          git apply "$RUNNER_TEMP/results/agent/agent.patch"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.guard.outputs.state == 'apply' && contains(needs.scope.outputs.stacks, 'backend')
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.guard.outputs.state == 'apply' && contains(needs.scope.outputs.stacks, 'frontend')
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install project dependencies
+        if: steps.guard.outputs.state == 'apply'
+        run: *install
+
+      - name: Re-run suites independently
+        if: steps.guard.outputs.state == 'apply'
+        run: |
+          R="$RUNNER_TEMP/results"
+          mkdir -p "$R/verify"
+          python3 - "$R/guard.json" > "$RUNNER_TEMP/changed-tests" <<'EOF'
+          import json, sys
+          for item in json.load(open(sys.argv[1]))["files"]:
+              print(item["path"])
+          EOF
+          record() { echo "$1=$2" >> "$R/verify/codes"; }
+          for stack in $STACKS; do
+            set +e
+            scripts/agent/run_tests.sh "$stack" "$R/verify"; record "$stack tests" $?
+            set -e
+          done
+          # Run the agent's test files twice more to catch order/time-dependent flakiness.
+          mapfile -t frontend_files < <(grep '^frontend/' "$RUNNER_TEMP/changed-tests" || true)
+          mapfile -t backend_tests < <(grep '^backend/' "$RUNNER_TEMP/changed-tests" | sed 's#^backend/##' || true)
+          frontend_tests=("${frontend_files[@]#frontend/}")
+          for run in 1 2; do
+            set +e
+            if (( ${#backend_tests[@]} )); then
+              scripts/agent/run_tests.sh backend "$RUNNER_TEMP/repeat-$run" "${backend_tests[@]}" >/dev/null; record "backend repeat $run" $?
+            fi
+            if (( ${#frontend_tests[@]} )); then
+              scripts/agent/run_tests.sh frontend "$RUNNER_TEMP/repeat-$run" "${frontend_tests[@]}" >/dev/null; record "frontend repeat $run" $?
+            fi
+            set -e
+          done
+          if [[ " $STACKS " == *" frontend "* ]]; then
+            set +e
+            scripts/agent/run_tests.sh typecheck "$R/verify"; record "typecheck" $?
+            if (( ${#frontend_files[@]} )); then
+              scripts/agent/run_tests.sh format-check "$R/verify" "${frontend_files[@]}"; record "prettier" $?
+            fi
+            set -e
+          fi
+
+      - name: Decide outcome
+        id: result
+        if: always()
+        env:
+          STATE: ${{ steps.guard.outputs.state }}
+        run: |
+          R="$RUNNER_TEMP/results"
+          if [[ "$STATE" != "apply" ]]; then
+            echo "outcome=${STATE:-verification-failed}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 - "$R/verify/codes" "$R/verify/status.json" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, sys
+          try:
+              codes = dict(line.rstrip("\n").rsplit("=", 1) for line in open(sys.argv[1]))
+          except FileNotFoundError:
+              codes = {}
+          status = {name: int(code) for name, code in codes.items()}
+          json.dump(status, open(sys.argv[2], "w"))
+          ok = bool(status) and all(code == 0 for code in status.values())
+          print(f"outcome={'verified' if ok else 'verification-failed'}")
+          EOF
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: verify-output
+          path: |
+            ${{ runner.temp }}/results/guard.json
+            ${{ runner.temp }}/results/verify
+          retention-days: 14
+
+  publish:
+    name: Publish results
+    needs: [scope, generate, verify]
+    if: >-
+      always() &&
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.self_commit != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job with write access. It never runs PR code: it applies a guarded,
+    # verified text patch, commits it and posts a comment, using base-branch scripts.
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      NEEDS_AGENT: ${{ needs.scope.outputs.needs_agent }}
+      GENERATE_RESULT: ${{ needs.generate.result }}
+      VERIFY_RESULT: ${{ needs.verify.result }}
+      VERIFY_OUTCOME: ${{ needs.verify.outputs.outcome }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Use agent tooling from the base branch
+        run: *trusted
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: scope
+          path: ${{ runner.temp }}/results
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.generate.result != 'skipped'
+        continue-on-error: true
+        with:
+          name: agent-output
+          path: ${{ runner.temp }}/results
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.verify.result != 'skipped'
+        continue-on-error: true
+        with:
+          name: verify-output
+          path: ${{ runner.temp }}/results
+
+      - name: Commit verified tests
+        id: commit
+        run: |
+          R="$RUNNER_TEMP/results"
+          if [[ "$NEEDS_AGENT" != "true" ]]; then outcome=skipped
+          elif [[ "$GENERATE_RESULT" != "success" ]]; then outcome=agent-failed
+          elif [[ "$VERIFY_RESULT" != "success" && -z "$VERIFY_OUTCOME" ]]; then outcome=verification-failed
+          else outcome="$VERIFY_OUTCOME"
+          fi
+
+          if [[ "$outcome" == "verified" ]]; then
+            if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]]; then
+              outcome=stale
+            elif ! python3 scripts/agent/guard_paths.py "$R/agent/agent.patch" > /dev/null; then
+              outcome=rejected   # defence in depth: never trust the upstream job's verdict alone
+            else
+              git apply --index "$R/agent/agent.patch"
+              git -c user.name="github-actions[bot]" \
+                  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                  commit --quiet -F - <<EOF
+          test: add unit tests generated by test agent
+
+          Generated by the test-engineer agent for ${HEAD_SHA}; verified by
+          independent test, typecheck and formatting runs in ${RUN_URL}.
+
+          Test-Agent: true
+          EOF
+              if git push origin "HEAD:refs/heads/${HEAD_REF}"; then
+                outcome=committed
+              else
+                outcome=stale
+              fi
+            fi
+          fi
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+          echo "Outcome: $outcome"
+
+      - name: Post PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ steps.commit.outputs.outcome || 'agent-failed' }}
+        run: |
+          python3 scripts/agent/render_report.py --dir "$RUNNER_TEMP/results" \
+            --sha "$HEAD_SHA" --run-url "$RUN_URL" --outcome "$OUTCOME" > "$RUNNER_TEMP/comment.md"
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          marker='<!-- taskly-test-agent -->'
+          comment_id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${marker}\"))) | .id" | tail -n 1)
+          if [[ -n "$comment_id" ]]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" -F body=@"$RUNNER_TEMP/comment.md" > /dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@"$RUNNER_TEMP/comment.md" > /dev/null
+          fi
+
+      - name: Fail the check on unsuccessful outcomes
+        if: always()
+        env:
+          OUTCOME: ${{ steps.commit.outputs.outcome || 'agent-failed' }}
+        run: |
+          case "$OUTCOME" in
+            committed|no-changes|skipped|stale) exit 0 ;;
+            *) echo "::error::Test agent outcome: $OUTCOME"; exit 1 ;;
+          esac

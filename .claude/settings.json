@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(scripts/agent/run_tests.sh:*)",
+      "Bash(python3 scripts/agent/changed_files.py:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git status:*)",
+      "Bash(npx prettier --write:*)",
+      "Bash(npm run typecheck)",
+      "Edit(backend/tests/**)",
+      "Edit(frontend/src/**/*.test.ts)",
+      "Edit(frontend/src/**/*.test.tsx)",
+      "Edit(.test-agent/**)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(**/.env)",
+      "WebFetch",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(git push:*)",
+      "Bash(git commit:*)",
+      "Bash(git config:*)",
+      "Bash(gh:*)",
+      "Bash(env)",
+      "Bash(printenv:*)",
+      "Bash(npm install:*)",
+      "Bash(npm i:*)",
+      "Bash(pip install:*)"
+    ]
+  }
+}

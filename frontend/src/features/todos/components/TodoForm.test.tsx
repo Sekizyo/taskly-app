@@ -45,4 +45,60 @@ describe('TodoForm', () => {
       completed: false,
     })
   })
+
+  it('edits description and due date starting from an existing task', async () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined)
+    const user = userEvent.setup()
+    render(
+      <TodoForm
+        initial={{
+          title: 'Existing',
+          description: '',
+          priority: 'low',
+          due_date: '2026-10-01',
+          completed: true,
+        }}
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+        busy={false}
+        error={null}
+      />,
+    )
+    expect(screen.getByLabelText(/Task title/)).toHaveValue('Existing')
+    await user.type(screen.getByLabelText(/Description/), '  Notes  ')
+    await user.clear(screen.getByLabelText(/Due date/))
+    await user.click(screen.getByRole('button', { name: 'Save task' }))
+    expect(onSubmit).toHaveBeenCalledWith({
+      title: 'Existing',
+      description: 'Notes',
+      priority: 'low',
+      due_date: null,
+      completed: true,
+    })
+  })
+
+  it('shows a server error and cancels without submitting', async () => {
+    const onSubmit = vi.fn()
+    const onCancel = vi.fn()
+    const user = userEvent.setup()
+    render(
+      <TodoForm
+        onSubmit={onSubmit}
+        onCancel={onCancel}
+        busy={false}
+        error="Task not found."
+      />,
+    )
+    expect(screen.getByTestId('alert')).toHaveTextContent('Task not found.')
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(onCancel).toHaveBeenCalledTimes(1)
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('locks the form while saving', () => {
+    render(<TodoForm onSubmit={vi.fn()} onCancel={vi.fn()} busy error={null} />)
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    expect(screen.getByLabelText(/Task title/)).toBeDisabled()
+  })
 })
