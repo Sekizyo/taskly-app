@@ -69,3 +69,20 @@ export function formatDate(date: string): string {
     year: 'numeric',
   }).format(new Date(`${date}T12:00:00`))
 }
+
+export interface TodoSummary {
+  total: number
+  completed: number
+  active: number
+  overdue: number
+}
+
+export function summarizeTodos(todos: Todo[]): TodoSummary {
+  const completed = todos.filter((todo) => todo.completed).length
+  return {
+    total: todos.length,
+    completed,
+    active: todos.length - completed,
+    overdue: todos.filter(isOverdue).length,
+  }
+}
